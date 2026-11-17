@@ -63,6 +63,69 @@ describe("Codex's items as Beluga's steps", () => {
 });
 
 describe('a Codex run', () => {
+  describe('explicit unrestricted owner runs', () => {
+    it.each(['--dangerously-bypass-approvals-and-sandbox', '--yolo'])('honors %s for your own editable run', async (flag) => {
+      const codex = new FakeCodex();
+      const connect = vi.fn(codex.connect);
+      const run = input('hello', { launchArgs: { codex: [flag, '-c', 'a=b'] }, askBeforeCommands: true });
+      await createCodexBackend({ cwd, autoEdit: true, additionalDirectories: [], bridge: room, connect }).run(run);
+      const start = codex.sent('thread/start')[0]!;
+      expect(start.sandbox).toBe('danger-full-access');
+      expect(start.approvalPolicy).toBe('never');
+      expect((start.config as Record<string, unknown>)['permissions.beluga']).toBeUndefined();
+      expect(connect.mock.calls[0]?.[0]?.args).toEqual(['-c', 'a=b']);
+      expect(run.events.some(([kind, message]) => kind === 'progress' && /unrestricted/i.test(message))).toBe(true);
+      expect(start.developerInstructions).toMatch(/no filesystem sandbox/i);
+      expect(codex.sent('turn/start')[0]!.approvalPolicy).toBe('never');
+    });
+
+    it.each([
+      { viaAgent: true },
+      { guest: true },
+      { vetTool: () => undefined },
+      { asOwner: true, scope: 'full' as const },
+      { asOwner: true, scope: 'folder' as const },
+      { asksFirst: () => true },
+    ])('does not unsandbox another requester: %j', async (requester) => {
+      const codex = new FakeCodex();
+      const connect = vi.fn(codex.connect);
+      await createCodexBackend({ cwd, autoEdit: true, additionalDirectories: [], bridge: room, connect }).run(input('hello', { ...requester, launchArgs: { codex: ['--yolo'] } }));
+      const start = codex.sent('thread/start')[0]!;
+      expect(start.sandbox).toBeUndefined();
+      expect((start.config as Record<string, unknown>)['permissions.beluga']).toBeDefined();
+      expect(connect.mock.calls[0]?.[0]?.args ?? []).not.toContain('--yolo');
+    });
+
+    it('keeps the plan sandboxed, then resumes unrestricted only for approved work', async () => {
+      const codex = new FakeCodex();
+      await backend(codex).run(input('hello', { launchArgs: { codex: ['--yolo'] }, plan: true, askUser: async () => ({ kind: 'plan', approve: true, feedback: '' }) }));
+      const plan = codex.sent('thread/start')[0]!;
+      expect(plan.sandbox).toBeUndefined();
+      expect((plan.config as Record<string, { extends: string }>)['permissions.beluga']!.extends).toBe(':read-only');
+      const work = codex.sent('thread/resume')[0]!;
+      expect(work.sandbox).toBe('danger-full-access');
+      expect(work.approvalPolicy).toBe('never');
+    });
+
+    it('keeps read-only conversations sandboxed even with an explicit bypass', async () => {
+      const codex = new FakeCodex();
+      await backend(codex).run(input('hello', { launchArgs: { codex: ['--yolo'] }, place: { cwd, autoEdit: false, additionalDirectories: [], onSession: () => undefined } }));
+      const start = codex.sent('thread/start')[0]!;
+      expect(start.sandbox).toBeUndefined();
+      expect((start.config as Record<string, { extends: string }>)['permissions.beluga']!.extends).toBe(':read-only');
+    });
+
+    it('does not let an earlier unrestricted run loosen the next sandboxed run', async () => {
+      const codex = new FakeCodex();
+      const agent = backend(codex);
+      await agent.run(input('hello', { launchArgs: { codex: ['--yolo'] } }));
+      await agent.run(input('hello'));
+      const resumed = codex.sent('thread/resume')[0]!;
+      expect(resumed.sandbox).toBeUndefined();
+      expect((resumed.config as Record<string, unknown>)['permissions.beluga']).toBeDefined();
+    });
+  });
+
   it("mounts Beluga's tools as stdio MCP servers and gives Beluga's instructions as developer instructions", async () => {
     const codex = new FakeCodex();
     const run = input('hello', { scratchDir: '.beluga/scratch' });

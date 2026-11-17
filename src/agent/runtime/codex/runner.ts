@@ -186,6 +186,13 @@ export function createCodexBackend(opts: CodexBackendOptions): AgentBackend {
       const askOnly = place?.askOnly;
       // A talk dialogue's turn only looks: Codex's sandbox writes nowhere (talkReadOnly gates only Beluga's tools).
       const autoEdit = !askOnly && !input.dialogue?.readOnly && (place?.autoEdit ?? opts.autoEdit);
+      // Consume bypass flags here rather than at app-server startup: even an owner-configured
+      // flag must not loosen plans, read-only chats, or external/friend requests.
+      const launchFlags = input.launchArgs?.codex ?? [];
+      const bypassFlag = (arg: string): boolean => arg === '--dangerously-bypass-approvals-and-sandbox' || arg === '--yolo';
+      const bypassRequested = launchFlags.some(bypassFlag);
+      const launchArgs = launchFlags.filter((arg) => !bypassFlag(arg));
+      const directOwner = !input.viaAgent && !input.guest && !input.asOwner && !input.vetTool && !input.asksFirst;
       const fixup = place?.fixup;
       const syncMain = askOnly ? place?.syncMain : undefined;
       const policy = { cwd, roots: [cwd, ...extraDirs, ...(fixup ? [fixup] : [])], autoEdit, scope: input.scope, guest: input.guest, boardAsks: input.boardAsks, dotenv: Boolean(input.canUseSecret) && !input.guest, yourRun: isYourRun(input), askOnly: Boolean(askOnly), ...(syncMain ? { syncMain: syncProbes(cwd, syncMain) } : {}), ...(fixup ? { fixup } : {}), ...(place?.alsoEdit?.length ? { alsoEdit: place.alsoEdit } : {}) };
@@ -238,8 +245,9 @@ export function createCodexBackend(opts: CodexBackendOptions): AgentBackend {
          * it's opened, never by a turn, so the work isn't done under the plan's read-only one.
          */
         const open = async (planning: boolean, resume: string | undefined): Promise<string> => {
-          // Your `codex` flags (Settings › Agents) on your own runs; Beluga still sets each turn's sandbox.
-          const link = await connect({ cwd, env: { ...process.env, ...input.env }, ...(opts.codexPath ? { bin: opts.codexPath } : {}), ...(input.launchArgs?.codex?.length ? { args: input.launchArgs.codex } : {}) });
+          const unrestricted = bypassRequested && directOwner && autoEdit && !planning;
+          // Beluga selects each thread's permissions, including the explicit owner-only bypass.
+          const link = await connect({ cwd, env: { ...process.env, ...input.env }, ...(opts.codexPath ? { bin: opts.codexPath } : {}), ...(launchArgs.length ? { args: launchArgs } : {}) });
           conn = link;
           const { rpc } = link;
           input.onProcess?.(link.proc);
@@ -293,15 +301,19 @@ export function createCodexBackend(opts: CodexBackendOptions): AgentBackend {
           // A friend's task gets none of your own Codex MCP servers: their names, to switch them off.
           const yourServers = trustRow(origin, input.scope).yourTools ? [] : await rpc.request<{ config?: { mcp_servers?: Record<string, unknown> } }>('config/read', {}).then((r) => Object.keys(r.config?.mcp_servers ?? {}), () => []);
           const writableRoots = planning || !autoEdit ? (fixup ? [fixup] : []) : [cwd, ...extraDirs, ...(fixup ? [fixup] : [])];
-          const confined = codexConfinement(origin, input.scope, { cwd, folders: [...extraDirs, ...(fixup ? [fixup] : [])], writable: writableRoots, yourServers });
-          approval = approvalFor(confined.row, { planning, ...(input.askBeforeCommands ? { askBeforeCommands: true } : {}) });
+          const folders = [...extraDirs, ...(fixup ? [fixup] : [])];
+          const confined: CodexConfinement = unrestricted
+            ? { row: trustRow(origin, input.scope), config: {}, approval: 'never' }
+            : codexConfinement(origin, input.scope, { cwd, folders, writable: writableRoots, yourServers });
+          approval = unrestricted ? 'never' : approvalFor(confined.row, { planning, ...(input.askBeforeCommands ? { askBeforeCommands: true } : {}) });
+          if (unrestricted) input.onEvent('progress', 'Unrestricted Codex: filesystem sandbox and command approvals are off for this run.');
           if (!settled) {
             settled = true;
             await settle(rpc, input.model ?? place?.model ?? opts.model);
           }
-          const instructions = runInstructions(input, opts.bridge.selfName(), CODEX_AGENT);
+          const instructions = runInstructions(input, opts.bridge.selfName(), CODEX_AGENT) + (unrestricted ? `\n\n${UNRESTRICTED_NOTE}` : '');
           const begin = async (c: CodexConfinement, loose: boolean): Promise<ThreadStartResponse> => {
-            const params = { cwd, ...(model ? { model } : {}), developerInstructions: loose ? `${instructions}\n\n${LOOSE_NOTE}` : instructions, config: { ...c.config, ...PROJECT_DOCS, ...runFeatures(c.row.yourTools), ...mcpConfig(mounted.servers) }, approvalPolicy: approval };
+            const params = { cwd, ...(model ? { model } : {}), ...(unrestricted ? { sandbox: 'danger-full-access' } : {}), developerInstructions: loose ? `${instructions}\n\n${LOOSE_NOTE}` : instructions, config: { ...c.config, ...PROJECT_DOCS, ...runFeatures(c.row.yourTools), ...mcpConfig(mounted.servers) }, approvalPolicy: approval };
             let thread: ThreadStartResponse | undefined;
             if (resume) {
               // Its sandbox refusing the profile isn't a lost conversation: that's told by opening it again below.
@@ -317,7 +329,9 @@ export function createCodexBackend(opts: CodexBackendOptions): AgentBackend {
             input.onEvent('progress', WINDOWS_READS);
             return begin(loose, true);
           };
-          const thread = readsOpen
+          const thread = unrestricted
+            ? await begin(confined, false)
+            : readsOpen
             ? await loosened()
             : await begin(confined, false).catch((err: unknown) => {
                 if (!readsUndeniable(err)) throw err;
@@ -649,6 +663,7 @@ const PROJECT_DOCS = { project_doc_fallback_filenames: ['CLAUDE.md'] };
 const WINDOWS_READS =
   'Codex’s Windows sandbox on this account can’t hide files, so this run can read your .env files and credential stores (its writes still stay in its folders). To hide them again, use Codex’s elevated sandbox (windows.sandbox = "elevated" in ~/.codex/config.toml, set up once as an administrator) or MXC where Windows supports it.';
 const LOOSE_NOTE = "Your sandbox here can't hide .env files, keys or credential stores: don't read them unless the person asks you to.";
+const UNRESTRICTED_NOTE = "The owner explicitly selected unrestricted Codex for this run: there is no filesystem sandbox and no command approval prompt. Earlier descriptions of sandbox-enforced file denials do not apply to this run. Files outside the worktree, including credentials, are reachable with the owner's account permissions; read secrets only when the owner asks. Beluga's own tools still use their normal permission gates.";
 /** Anyone else's run there: refused, as its denials are what keeps it out of your secrets. */
 const WINDOWS_REFUSED =
   'Codex’s Windows sandbox on this account can’t keep this task away from your home, .env files and credential stores, so Beluga won’t run it on Codex. Use Codex’s elevated sandbox (windows.sandbox = "elevated" in ~/.codex/config.toml, set up once as an administrator) or MXC where Windows supports it, or run it on Claude.';
