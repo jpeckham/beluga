@@ -117,6 +117,8 @@ export interface ConfinementPlace {
   readonly folders: readonly string[];
   /** Of those (and cwd), the ones the run may change: none in a main folder, while planning, or in a read-only share. */
   readonly writable: readonly string[];
+  /** Validated linked Git metadata, readable even when outside the editable folders. */
+  readonly readDependencies?: readonly string[];
   /** Your own MCP servers in ~/.codex/config.toml, switched off when the row says so. */
   readonly yourServers?: readonly string[];
   readonly home?: string;
@@ -179,7 +181,12 @@ export function codexConfinement(origin: RunOrigin, scope: 'folder' | 'full', pl
   // Beluga's own files (identity, settings, trust choices); the run's folders inside it stay open below.
   filesystem[place.belugaHome ?? belugaHomeDir()] = 'deny';
   for (const root of roots) filesystem[root] = writable.has(root) ? 'write' : 'read';
-  for (const root of roots) for (const glob of SECRET_GLOBS) filesystem[`${root}/**/${glob}`] = 'deny';
+  const dependencies = (place.readDependencies ?? []).map((p) => path.resolve(p)).filter((dep) => !HOME_SECRETS.some((rel) => {
+    const relative = path.relative(path.join(home, rel), dep);
+    return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+  }));
+  for (const dep of dependencies) if (filesystem[dep] !== 'deny') filesystem[dep] = 'read';
+  for (const root of [...roots, ...dependencies]) for (const glob of SECRET_GLOBS) filesystem[`${root}/**/${glob}`] = 'deny';
   // Linux cannot reopen read-only descendants of a denied home. Start restricted runs from
   // system-tool reads instead; only the declared folders and git config expose user files.
   const minimalLinux = process.platform === 'linux' && row.home === 'denied';
@@ -224,8 +231,8 @@ export function withoutReadDenials(c: CodexConfinement): CodexConfinement | unde
  * asked for it: what a chat answer reads can come from a friend. The network is on only for a call
  * given Bash (a pull request's review runs git); one given no tools can't read the folder either.
  */
-export function sideCallConfinement(cwd: string, opts: { readonly tools?: readonly string[]; readonly yourServers?: readonly string[]; readonly home?: string; readonly belugaHome?: string } = {}): CodexConfinement {
-  const base = codexConfinement('friend', 'folder', { cwd, folders: [], writable: [], ...(opts.yourServers ? { yourServers: opts.yourServers } : {}), ...(opts.home ? { home: opts.home } : {}), ...(opts.belugaHome ? { belugaHome: opts.belugaHome } : {}) });
+export function sideCallConfinement(cwd: string, opts: { readonly tools?: readonly string[]; readonly readDependencies?: readonly string[]; readonly yourServers?: readonly string[]; readonly home?: string; readonly belugaHome?: string } = {}): CodexConfinement {
+  const base = codexConfinement('friend', 'folder', { cwd, folders: [], writable: [], ...((opts.tools?.length && opts.readDependencies) ? { readDependencies: opts.readDependencies } : {}), ...(opts.yourServers ? { yourServers: opts.yourServers } : {}), ...(opts.home ? { home: opts.home } : {}), ...(opts.belugaHome ? { belugaHome: opts.belugaHome } : {}) });
   const profile = base.config[`permissions.${PROFILE}`] as { extends?: string; filesystem: Record<string, string>; network: { enabled: boolean } };
   const tools = opts.tools ?? [];
   const filesystem = tools.length ? profile.filesystem : { ...profile.filesystem, [path.resolve(cwd)]: 'deny' };

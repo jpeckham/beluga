@@ -4,6 +4,7 @@ import { type CodexConnect, spawnAppServer } from './app-server.js';
 import type { Model, ThreadItem, ThreadStartResponse, Turn } from './protocol.js';
 import { RUN_FEATURES_OFF, mcpConfig, pickCodexModel } from './runner.js';
 import { sideCallConfinement } from './sandbox.js';
+import { codexGitDependencies } from './git-dependencies.js';
 
 let host: ToolHost | undefined;
 const MODEL_LIST_TIMEOUT_MS = 10_000;
@@ -48,7 +49,8 @@ export async function codexComplete(req: CompletionRequest, deps: { readonly con
     // Claude's 'haiku' (a quick side call): Codex's small, fast model when it lists one; 'sonnet'/'opus': its default.
     const model = await pickCodexModel(req.model, () => rpc.request<{ data: Model[] }>('model/list', {}, MODEL_LIST_TIMEOUT_MS).then((r) => r.data));
     const yourServers = await rpc.request<{ config?: { mcp_servers?: Record<string, unknown> } }>('config/read', {}).then((r) => Object.keys(r.config?.mcp_servers ?? {}), () => []);
-    const confined = sideCallConfinement(req.cwd, { ...(req.tools ? { tools: req.tools } : {}), yourServers });
+    const readDependencies = req.tools?.length ? await codexGitDependencies([req.cwd]) : [];
+    const confined = sideCallConfinement(req.cwd, { ...(req.tools ? { tools: req.tools } : {}), readDependencies, yourServers });
     const thread = await rpc.request<ThreadStartResponse>('thread/start', {
       cwd: req.cwd,
       ...(model ? { model } : {}),
